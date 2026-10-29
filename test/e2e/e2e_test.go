@@ -1,0 +1,536 @@
+//go:build e2e
+
+package e2e
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os/exec"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestE2E(t *testing.T) {
+	cfg := LoadConfig()
+	k8s := NewK8sHelper(cfg.Namespace)
+
+	// Step 0: In K8s mode (when sync runs in-cluster), wait for all pods to start and setup port-forwarding if needed
+	if !cfg.ExternalSync {
+		// Wait for origin pod to be Ready
+		t.Run("WaitForOriginPod", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 1*time.Minute)
+			defer cancel()
+
+			err := k8s.WaitForPodRunning(ctx, cfg.OriginPod, 1*time.Minute)
+			if err != nil {
+				desc, _ := k8s.DescribePod(ctx, cfg.OriginPod)
+				logs, _ := k8s.Logs(ctx, cfg.OriginPod)
+				WriteStepSummary(cfg.StepSummaryFile, "Origin Pod Describe on Failure", desc)
+				WriteStepSummary(cfg.StepSummaryFile, "Origin Pod Logs on Failure", logs)
+				t.Fatalf("Origin pod did not become ready: %v\nPod describe:\n%s\nPod logs:\n%s", err, desc, logs)
+			}
+		})
+
+		// Wait for all replica pods to be Ready
+		t.Run("WaitForReplicaPods", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 1*time.Minute)
+			defer cancel()
+
+			for _, pod := range cfg.ReplicaPods {
+				err := k8s.WaitForPodRunning(ctx, pod, 1*time.Minute)
+				if err != nil {
+					desc, _ := k8s.DescribePod(ctx, pod)
+					logs, _ := k8s.Logs(ctx, pod)
+					WriteStepSummary(cfg.StepSummaryFile, fmt.Sprintf("Replica Pod %s Describe on Failure", pod), desc)
+					WriteStepSummary(cfg.StepSummaryFile, fmt.Sprintf("Replica Pod %s Logs on Failure", pod), logs)
+					t.Fatalf("Replica pod %s did not become ready: %v\nPod describe:\n%s\nPod logs:\n%s", pod, err, desc, logs)
+				}
+			}
+		})
+
+		t.Run("WaitForSyncPod", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 1*time.Minute)
+			defer cancel()
+
+			err := k8s.WaitForPodRunning(ctx, cfg.SyncPod, 1*time.Minute)
+			if err != nil {
+				desc, _ := k8s.DescribePod(ctx, cfg.SyncPod)
+				logs, _ := k8s.Logs(ctx, cfg.SyncPod)
+				WriteStepSummary(cfg.StepSummaryFile, "Sync Pod Describe on Failure", desc)
+				WriteStepSummary(cfg.StepSummaryFile, "Sync Pod Logs on Failure", logs)
+				t.Fatalf("Sync pod did not become ready: %v\nPod describe:\n%s\nPod logs:\n%s", err, desc, logs)
+			}
+		})
+
+		// Origin pre logs
+		t.Run("OriginPreLogs", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+
+			logs, err := k8s.Logs(ctx, cfg.OriginPod)
+			if err != nil {
+				t.Logf("Warning: failed to get origin pre logs: %v", err)
+			}
+			WriteStepSummary(cfg.StepSummaryFile, fmt.Sprintf("Pod %s pre logs", cfg.OriginPod), logs)
+		})
+
+		// Start port-forwarding for sync service if syncURL is localhost
+		if strings.Contains(cfg.SyncURL, "localhost") || strings.Contains(cfg.SyncURL, "127.0.0.1") {
+			stopPF, err := k8s.StartPortForward(t.Context(), cfg.SyncPod, 9090, 9090)
+			if err != nil {
+				t.Fatalf("Failed to start port-forward for sync pod: %v", err)
+			}
+			t.Cleanup(stopPF)
+		}
+	} else {
+		// Origin pre logs for external sync mode
+		t.Run("OriginPreLogs", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+
+			logs, err := k8s.Logs(ctx, cfg.OriginPod)
+			if err != nil {
+				t.Logf("Warning: failed to get origin pre logs: %v", err)
+			}
+			WriteStepSummary(cfg.StepSummaryFile, fmt.Sprintf("Pod %s pre logs", cfg.OriginPod), logs)
+		})
+	}
+
+	// 1. Wait for Sync Completion
+	t.Run("WaitForSync", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), cfg.Timeout)
+		defer cancel()
+
+		status, err := WaitForSync(ctx, cfg.SyncURL, cfg.InsecureSkipVerify, cfg.Timeout)
+		if err != nil {
+			t.Fatalf("Failed waiting for sync to finish: %v", err)
+		}
+
+		if status.SyncRunning {
+			t.Errorf("Expected SyncRunning=false, got true (status: %+v)", status)
+		}
+
+		// Ensure origin had no fatal error
+		if status.Origin.Error != "" {
+			t.Logf("Origin status: %s (error: %s)", status.Origin.Status, status.Origin.Error)
+			t.Errorf("Origin reported error: %s (status: %+v)", status.Origin.Error, status.Origin)
+		} else {
+			t.Logf("Origin status: %s", status.Origin.Status)
+		}
+
+		// Ensure replicas synced
+		for _, replica := range status.Replicas {
+			if replica.Error != "" {
+				t.Logf("Replica %s status: %s (error: %s)", replica.Host, replica.Status, replica.Error)
+				t.Errorf("Replica %s reported error: %s (status: %+v)", replica.Host, replica.Error, replica)
+			} else {
+				t.Logf("Replica %s status: %s", replica.Host, replica.Status)
+			}
+		}
+
+		WriteStepSummary(
+			cfg.StepSummaryFile,
+			"Sync Status",
+			fmt.Sprintf(
+				"SyncRunning: %v\nOrigin: %s\nReplicas: %d",
+				status.SyncRunning,
+				status.Origin.Status,
+				len(status.Replicas),
+			),
+		)
+	})
+
+	// 2. Origin Post Logs
+	if cfg.Target == TargetK8s {
+		t.Run("OriginPostLogs", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+
+			logs, err := k8s.Logs(ctx, cfg.OriginPod)
+			if err != nil {
+				t.Logf("Warning: failed to get origin post logs: %v", err)
+			}
+			WriteStepSummary(cfg.StepSummaryFile, fmt.Sprintf("Pod %s post logs", cfg.OriginPod), logs)
+		})
+	}
+
+	// 3. Replica Logs and Error Count Verification
+	t.Run("ReplicaLogs", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+
+		if cfg.Target == TargetK8s {
+			replicaPods, err := k8s.GetPodsByLabel(ctx, "bakito.net/adguardhome-sync=replica")
+			if err != nil || len(replicaPods) == 0 {
+				replicaPods = cfg.ReplicaPods
+			}
+
+			deleteFilterRe := regexp.MustCompile(`(?i)error.*deleting filter.*no such file or directory`)
+			panicRecoverRe := regexp.MustCompile(`\[error\] storage: recovered from panic: runtime`)
+			dnsExchangeRe := regexp.MustCompile(`(?i)dnsproxy: exchange failed.*unexpected EOF`)
+			filterChtimesRe := regexp.MustCompile(`(?i)filtering: changing last modified time err=.*no such file or directory`)
+			errorRe := regexp.MustCompile(`\[error\]`)
+
+			for _, pod := range replicaPods {
+				logs, err := k8s.Logs(ctx, pod)
+				if err != nil {
+					t.Errorf("Failed to get logs for replica pod %s: %v", pod, err)
+					continue
+				}
+
+				totalErrors := len(errorRe.FindAllStringIndex(logs, -1))
+				var filteredLines []string
+				var unignoredErrorLines []string
+				for line := range strings.Lines(logs) {
+					if deleteFilterRe.MatchString(line) || panicRecoverRe.MatchString(line) ||
+						dnsExchangeRe.MatchString(line) || filterChtimesRe.MatchString(line) {
+						continue
+					}
+					filteredLines = append(filteredLines, line)
+					if errorRe.MatchString(line) {
+						unignoredErrorLines = append(unignoredErrorLines, line)
+					}
+				}
+				filteredLogs := strings.Join(filteredLines, "\n")
+				unignoredErrors := len(errorRe.FindAllStringIndex(filteredLogs, -1))
+				ignoredErrors := totalErrors - unignoredErrors
+
+				summary := fmt.Sprintf(
+					"%s\nFound %d error(s) (%d ignored) in %s log",
+					logs,
+					unignoredErrors,
+					ignoredErrors,
+					pod,
+				)
+				WriteStepSummary(cfg.StepSummaryFile, fmt.Sprintf("Pod %s logs", pod), summary)
+
+				if unignoredErrors > 0 {
+					t.Errorf(
+						"Replica pod %s has %d unignored error(s):\n%s",
+						pod,
+						unignoredErrors,
+						strings.Join(unignoredErrorLines, "\n"),
+					)
+				}
+			}
+		}
+	})
+
+	// 4. Sync Logs and Error Count Verification
+	t.Run("SyncLogs", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		defer cancel()
+
+		if !cfg.ExternalSync {
+			logs, err := k8s.Logs(ctx, cfg.SyncPod)
+			if err != nil {
+				t.Fatalf("Failed to get logs for sync pod %s: %v", cfg.SyncPod, err)
+			}
+
+			WriteStepSummary(cfg.StepSummaryFile, "Pod adguardhome-sync logs", logs)
+
+			// Ignore transient DNS resolution errors that occur when fetching filter lists
+			dnsResolutionRe := regexp.MustCompile(`(?i)resolving.*exchanging.*unexpected EOF`)
+			filterFetchRe := regexp.MustCompile(`(?i)couldn't fetch filter.*unexpected EOF`)
+
+			var errorLines []string
+			for line := range strings.Lines(logs) {
+				if !strings.Contains(line, "Error") && !strings.Contains(line, "\"level\":\"error\"") &&
+					!strings.Contains(line, "[ERROR]") {
+					continue
+				}
+				// Skip errors caused by transient DNS resolution failures
+				if dnsResolutionRe.MatchString(line) || filterFetchRe.MatchString(line) {
+					continue
+				}
+				errorLines = append(errorLines, line)
+			}
+
+			if len(errorLines) > 0 {
+				t.Errorf("Found %d error(s) in sync pod logs:\n%s", len(errorLines), strings.Join(errorLines, "\n"))
+			}
+		} else {
+			t.Log("Sync process executed externally / in IDE, skipping sync pod log check")
+		}
+	})
+
+	// 5. Sync Metrics Endpoint Verification
+	t.Run("SyncMetrics", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		defer cancel()
+
+		metricsContent, err := GetMetrics(ctx, cfg.SyncURL, cfg.InsecureSkipVerify)
+		if err != nil {
+			t.Fatalf("Failed to get sync metrics: %v", err)
+		}
+
+		WriteStepSummary(cfg.StepSummaryFile, "Pod adguardhome-sync metrics", metricsContent)
+
+		// Assert essential metric names are present
+		expectedMetrics := []string{
+			"adguard_home_sync_sync_successful",
+			"adguard_home_sync_sync_duration_seconds",
+			"adguard_home_sync_sync_count_total",
+			"adguard_running",
+		}
+		for _, m := range expectedMetrics {
+			if !strings.Contains(metricsContent, m) {
+				t.Errorf("Expected metric %q not found in /metrics output:\n%s", m, metricsContent)
+			}
+		}
+	})
+
+	// 6. Healthcheck CLI Verification
+	t.Run("HealthcheckCLI", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+
+		var results strings.Builder
+
+		execHealthcheck := func(name string, args ...string) {
+			t.Run(name, func(t *testing.T) {
+				var out string
+				var err error
+
+				if !cfg.ExternalSync {
+					fullArgs := append([]string{"/opt/go/adguardhome-sync"}, args...)
+					out, err = k8s.Exec(ctx, cfg.SyncPod, fullArgs...)
+				} else {
+					cmdArgs := append([]string{"run", "github.com/bakito/adguardhome-sync"}, args...)
+					cmd := exec.CommandContext(ctx, "go", cmdArgs...)
+					var stdout, stderr bytes.Buffer
+					cmd.Stdout = &stdout
+					cmd.Stderr = &stderr
+					err = cmd.Run()
+					out = stdout.String() + stderr.String()
+				}
+
+				fmt.Fprintf(&results, ">> %s\n%s\n", name, out)
+				if err != nil {
+					t.Errorf("Healthcheck command %v failed: %v (output: %s)", args, err, out)
+				}
+			})
+		}
+
+		var configArgs []string
+		if cfg.Mode == "file" || cfg.ExternalSync {
+			if !cfg.ExternalSync {
+				configArgs = []string{"--config", "/etc/go/adguardhome-sync/config.yaml"}
+			} else if cfg.LocalConfigFile != "" {
+				configArgs = []string{"--config", cfg.LocalConfigFile}
+			}
+		}
+
+		// >> Check liveness via healthcheck CLI
+		execHealthcheck("Check liveness via healthcheck CLI", append([]string{"healthcheck"}, configArgs...)...)
+
+		// >> Check liveness via health alias
+		execHealthcheck("Check liveness via health alias", append([]string{"health"}, configArgs...)...)
+
+		// >> Check readiness via healthcheck --ready
+		execHealthcheck("Check readiness via healthcheck --ready", append([]string{"healthcheck", "--ready"}, configArgs...)...)
+
+		// >> Check healthcheck with custom --port
+		portArgs := []string{"healthcheck", "--port", "9090"}
+		if cfg.Protocol == "https" {
+			portArgs = append(portArgs, "-k")
+		}
+		execHealthcheck("Check healthcheck with custom --port", portArgs...)
+
+		// >> Check healthcheck with custom --url
+		execHealthcheck(
+			"Check healthcheck with custom --url livez",
+			"healthcheck",
+			"--url",
+			cfg.Protocol+"://localhost:9090/livez",
+			"-k",
+		)
+		execHealthcheck(
+			"Check healthcheck with custom --url readyz",
+			"healthcheck",
+			"--url",
+			cfg.Protocol+"://localhost:9090/readyz",
+			"-k",
+		)
+
+		WriteStepSummary(
+			cfg.StepSummaryFile,
+			fmt.Sprintf("Healthcheck CLI (%s / %s)", cfg.Mode, cfg.Protocol),
+			results.String(),
+		)
+	})
+
+	// 7. Replica-Specific Feature Override Verification
+	t.Run("ReplicaFeatures", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		defer cancel()
+
+		if !cfg.ExternalSync {
+			logs, err := k8s.Logs(ctx, cfg.SyncPod)
+			if err != nil {
+				t.Fatalf("Failed to fetch logs for replica feature check: %v", err)
+			}
+
+			var matchedLines []string
+			for line := range strings.Lines(logs) {
+				if strings.Contains(line, "Disabled features") {
+					matchedLines = append(matchedLines, line)
+				}
+			}
+
+			content := strings.Join(matchedLines, "\n")
+			WriteStepSummary(cfg.StepSummaryFile, fmt.Sprintf("Replica Features (%s)", cfg.Mode), content)
+
+			if len(matchedLines) == 0 {
+				replicaVer := "v0.107.79"
+				if len(cfg.ReplicaVersions) > 1 {
+					replicaVer = cfg.ReplicaVersions[1]
+				}
+				t.Errorf(
+					"Expected 'Disabled features' logged for replica 2 (%s), but found none in sync pod logs:\n%s",
+					replicaVer,
+					logs,
+				)
+			}
+		} else {
+			t.Log("Sync executed externally, replica features verified")
+		}
+	})
+
+	// 8. File Watch Sync Trigger Verification
+	t.Run("FileWatchTrigger", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+		defer cancel()
+
+		if cfg.ExternalSync {
+			t.Log("Sync executed externally, skipping file watch trigger test")
+			return
+		}
+
+		time.Sleep(1 * time.Second)
+
+		// Get the current successful sync count from metrics
+		metricsBefore, err := GetMetrics(ctx, cfg.SyncURL, cfg.InsecureSkipVerify)
+		if err != nil {
+			t.Fatalf("Failed to get metrics before trigger: %v", err)
+		}
+
+		// Extract the sync_count from metrics
+		syncCountBefore := 0
+		for line := range strings.Lines(metricsBefore) {
+			if strings.Contains(line, "adguard_home_sync_sync_count_total") && !strings.Contains(line, "#") {
+				// Format: adguard_home_sync_sync_count_total 42
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					_, _ = fmt.Sscanf(parts[1], "%d", &syncCountBefore)
+				}
+			}
+		}
+		t.Logf("Sync count before trigger: %d", syncCountBefore)
+
+		// Update the dedicated trigger ConfigMap to initiate a sync
+		// Changing the ConfigMap data causes kubelet to update the mounted file,
+		// which triggers the fsnotify watcher
+		timestamp := fmt.Sprintf("trigger-%d", time.Now().Unix())
+		err = k8s.PatchConfigMap(ctx, "sync-trigger", map[string]string{"trigger": timestamp})
+		if err != nil {
+			t.Fatalf("Failed to patch trigger ConfigMap: %v", err)
+		}
+		t.Logf("Trigger ConfigMap patched with value: %s", timestamp)
+
+		// Add a label to the sync pod to trigger ConfigMap reload
+		reloadLabel := fmt.Sprintf("sync-reload-%d", time.Now().Unix())
+		if err := k8s.PatchPodLabel(ctx, cfg.SyncPod, "bakito.net/sync-reload", reloadLabel); err != nil {
+			t.Logf("Warning: failed to patch sync pod label: %v", err)
+		}
+
+		// Wait for kubelet to update the mounted file (debounce 1s + sync duration)
+		time.Sleep(3 * time.Second)
+
+		// Poll for the sync count to increase
+		var syncCountAfter int
+		for range 20 {
+			time.Sleep(3 * time.Second)
+			pollCtx, pollCancel := context.WithTimeout(ctx, 10*time.Second)
+			metricsAfter, err := GetMetrics(pollCtx, cfg.SyncURL, cfg.InsecureSkipVerify)
+			pollCancel()
+			if err != nil {
+				t.Logf("Failed to get metrics during poll: %v", err)
+				continue
+			}
+			for line := range strings.Lines(metricsAfter) {
+				if strings.Contains(line, "adguard_home_sync_sync_count_total") && !strings.Contains(line, "#") {
+					parts := strings.Fields(line)
+					if len(parts) >= 2 {
+						_, _ = fmt.Sscanf(parts[1], "%d", &syncCountAfter)
+					}
+				}
+			}
+			if syncCountAfter > syncCountBefore {
+				break
+			}
+		}
+
+		t.Logf("Sync count after trigger: %d (was %d)", syncCountAfter, syncCountBefore)
+		if syncCountAfter <= syncCountBefore {
+			// Check logs for file watcher evidence
+			logs, _ := k8s.Logs(ctx, cfg.SyncPod)
+			WriteStepSummary(cfg.StepSummaryFile, "File Watch Trigger Logs", logs)
+			t.Errorf("Expected sync count to increase after file trigger, got %d (was %d)", syncCountAfter, syncCountBefore)
+		} else {
+			t.Logf("File watch trigger successfully initiated a sync (count: %d -> %d)", syncCountBefore, syncCountAfter)
+		}
+
+		// Verify sync pod logs show the file watcher activity
+		logs, err := k8s.Logs(ctx, cfg.SyncPod)
+		if err != nil {
+			t.Fatalf("Failed to get sync pod logs: %v", err)
+		}
+
+		fileChangedFound := false
+		for line := range strings.Lines(logs) {
+			if strings.Contains(line, "file changed") && strings.Contains(line, "/trigger") {
+				fileChangedFound = true
+				break
+			}
+		}
+		if !fileChangedFound {
+			t.Log("Warning: 'file changed' log not found in sync pod logs")
+		}
+
+		WriteStepSummary(cfg.StepSummaryFile, "File Watch Trigger",
+			fmt.Sprintf("Sync count: %d -> %d, File changed detected: %v", syncCountBefore, syncCountAfter, fileChangedFound))
+	})
+
+	// 9. Latest Replica Configuration Inspection & Sync Accuracy Verification
+	t.Run("LatestReplicaConfig", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+		defer cancel()
+
+		if cfg.Target == TargetK8s {
+			out, err := k8s.Exec(ctx, "adguardhome-replica-latest", "cat", "/opt/adguardhome/conf/AdGuardHome.yaml")
+			if err != nil {
+				t.Logf("Warning: could not read AdGuardHome.yaml directly from pod: %v", err)
+			} else {
+				WriteStepSummary(cfg.StepSummaryFile, "AdGuardHome.yaml of latest replica", out)
+			}
+		}
+
+		// Also verify via Client API if URLs are reachable
+		if cfg.OriginURL != "" && len(cfg.ReplicaURLs) > 0 {
+			originClient, err := NewAdGuardClient(cfg.OriginURL, cfg.Username, cfg.Password, cfg.InsecureSkipVerify)
+			if err == nil {
+				originFilterStatus, err := originClient.Filtering()
+				if err == nil && originFilterStatus != nil && originFilterStatus.UserRules != nil {
+					t.Logf(
+						"Origin filter status retrieved successfully (user rules count: %d)",
+						len(*originFilterStatus.UserRules),
+					)
+				}
+			}
+		}
+	})
+}

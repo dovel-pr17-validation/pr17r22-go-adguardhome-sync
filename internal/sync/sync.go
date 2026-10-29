@@ -1,0 +1,438 @@
+package sync
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"runtime"
+	"slices"
+	"time"
+
+	"github.com/robfig/cron/v3"
+	"go.uber.org/zap"
+
+	"github.com/bakito/adguardhome-sync/internal/client"
+	"github.com/bakito/adguardhome-sync/internal/client/model"
+	"github.com/bakito/adguardhome-sync/internal/log"
+	"github.com/bakito/adguardhome-sync/internal/metrics"
+	"github.com/bakito/adguardhome-sync/internal/types"
+	"github.com/bakito/adguardhome-sync/internal/versions"
+	"github.com/bakito/adguardhome-sync/version"
+)
+
+var l = log.GetLogger("sync")
+
+// Sync config from origin to replica.
+func Sync(cfg *types.Config) error {
+	if cfg.Origin.URL == "" {
+		return errors.New("origin URL is required")
+	}
+
+	if len(cfg.UniqueReplicas()) == 0 {
+		return errors.New("no replicas configured")
+	}
+
+	l.With(
+		"version", version.Version,
+		"build", version.Build,
+		"os", runtime.GOOS,
+		"arch", runtime.GOARCH,
+	).Info("AdGuardHome sync")
+	cfg.Log(l)
+	cfg.Features.LogDisabled(l)
+	cfg.Origin.AutoSetup = false
+
+	w := &worker{
+		cfg:          cfg,
+		createClient: client.New,
+	}
+	// Set up file watcher if configured
+	var fileWatch *FileWatcher
+	if cfg.SyncTriggerFile != "" {
+		fw, err := NewFileWatcher(cfg.SyncTriggerFile, time.Second, func() {
+			w.sync()
+		})
+		if err != nil {
+			l.With("error", err).Error("Error creating file watcher")
+			return err
+		}
+		fileWatch = fw
+		l.With("file", cfg.SyncTriggerFile).Info("File watcher configured")
+	}
+
+	if cfg.Cron != "" {
+		w.cron = cron.New()
+		cl := l.With("cron", cfg.Cron)
+		sched, err := cron.ParseStandard(cfg.Cron)
+		if err != nil {
+			cl.With("error", err).Error("Error parsing cron expression")
+			return err
+		}
+		cl = cl.With("next-execution", sched.Next(time.Now()))
+		_, err = w.cron.AddFunc(cfg.Cron, func() {
+			w.sync()
+		})
+		if err != nil {
+			cl.With("error", err).Error("Error during cron job setup")
+			return err
+		}
+		cl.Info("Setup cronjob")
+		if cfg.API.Port != 0 {
+			w.cron.Start()
+			if fileWatch != nil {
+				go func() {
+					if err := fileWatch.Start(); err != nil {
+						l.With("error", err).Error("File watcher error")
+					}
+				}()
+			}
+		} else {
+			runOnStartAsync(cfg, w)
+			if fileWatch != nil {
+				// Run file watcher in a goroutine, block on cron
+				go func() {
+					if err := fileWatch.Start(); err != nil {
+						l.With("error", err).Error("File watcher error")
+					}
+				}()
+			}
+			w.cron.Run()
+		}
+	}
+	if cfg.API.Port != 0 {
+		runOnStartAsync(cfg, w)
+		if fileWatch != nil {
+			go func() {
+				if err := fileWatch.Start(); err != nil {
+					l.With("error", err).Error("File watcher error")
+				}
+			}()
+		}
+		w.listenAndServe()
+	} else if cfg.RunOnStart {
+		l.Info("Running sync on startup")
+		w.sync()
+	}
+
+	// Clean up file watcher on exit
+	if fileWatch != nil {
+		fileWatch.Stop()
+	}
+
+	return nil
+}
+
+func runOnStartAsync(cfg *types.Config, w *worker) {
+	if cfg.RunOnStart {
+		go func() {
+			l.Info("Running sync on startup")
+			w.sync()
+		}()
+	}
+}
+
+type worker struct {
+	cfg          *types.Config
+	running      bool
+	cron         *cron.Cron
+	createClient func(instance types.AdGuardInstance, timeout time.Duration) (client.Client, error)
+}
+
+func (w *worker) status() *syncStatus {
+	syncStatus := &syncStatus{
+		Origin: w.getStatus(*w.cfg.Origin),
+	}
+
+	for _, replica := range w.cfg.Replicas {
+		st := w.getStatus(replica.Instance())
+		if w.running {
+			st.Status = StatusInfo
+		}
+		syncStatus.Replicas = append(syncStatus.Replicas, st)
+	}
+
+	slices.SortFunc(syncStatus.Replicas, func(i, j replicaStatus) int {
+		if i.Host < j.Host {
+			return -1
+		}
+		if i.Host > j.Host {
+			return 1
+		}
+		return 0
+	})
+
+	syncStatus.SyncRunning = w.running
+
+	return syncStatus
+}
+
+func (w *worker) getStatus(inst types.AdGuardInstance) replicaStatus {
+	st := replicaStatus{Host: inst.WebHost, URL: inst.WebURL}
+
+	oc, err := w.createClient(inst, w.cfg.ClientTimeout)
+	if err != nil {
+		l.With("error", err, "url", w.cfg.Origin.URL).Error("Error creating origin client")
+		st.Status = StatusDanger
+		st.Error = err.Error()
+		return st
+	}
+	sl := l.With("from", inst.WebHost)
+	status, err := oc.Status()
+	if err != nil {
+		if errors.Is(err, client.ErrSetupNeeded) {
+			st.Status = StatusWarning
+			st.Error = err.Error()
+			return st
+		}
+		sl.With("error", err).Error("Error getting origin status")
+		st.Status = StatusDanger
+		st.Error = err.Error()
+		return st
+	}
+	st.Status = StatusSuccess
+	st.ProtectionEnabled = new(status.ProtectionEnabled)
+	return st
+}
+
+func (w *worker) sync() {
+	if w.running {
+		l.Info("Sync already running")
+		return
+	}
+	w.running = true
+	defer func() {
+		w.running = false
+	}()
+	metrics.IncrementSyncCount()
+
+	oc, err := w.createClient(*w.cfg.Origin, w.cfg.ClientTimeout)
+	if err != nil {
+		l.With("error", err, "url", w.cfg.Origin.URL).Error("Error creating origin client")
+		return
+	}
+
+	sl := l.With("from", oc.Host())
+
+	o := &origin{}
+	o.status, err = oc.Status()
+	if err != nil {
+		sl.With("error", err).Error("Error getting origin status")
+		return
+	}
+
+	if versions.IsNewerThan(versions.MinAgh, o.status.Version) {
+		sl.With("error", err, "version", o.status.Version).
+			Errorf("Origin AdGuard Home version must be >= %s", versions.MinAgh)
+		return
+	}
+
+	sl.With("version", o.status.Version).Info("Connected to origin")
+
+	o.profileInfo, err = oc.ProfileInfo()
+	if err != nil {
+		sl.With("error", err).Error("Error getting profileInfo info")
+
+		// Workaround for https://github.com/AdguardTeam/AdGuardHome/issues/7987
+		// and https://github.com/AdguardTeam/AdGuardHome/issues/7985
+
+		clientErr := &client.Error{}
+		if !w.cfg.ContinueOnError || !errors.As(err, &clientErr) || clientErr.Code() != http.StatusUnauthorized {
+			return
+		}
+	}
+
+	o.parental, err = oc.Parental()
+	if err != nil {
+		sl.With("error", err).Error("Error getting parental status")
+		return
+	}
+	o.safeSearch, err = oc.SafeSearchConfig()
+	if err != nil {
+		sl.With("error", err).Error("Error getting safe search status")
+		return
+	}
+	o.safeBrowsing, err = oc.SafeBrowsing()
+	if err != nil {
+		sl.With("error", err).Error("Error getting safe browsing status")
+		return
+	}
+
+	o.rewriteSettings, err = oc.RewriteSettings()
+	if err != nil {
+		sl.With("error", err).Error("Error getting origin rewrite entries")
+		return
+	}
+
+	o.rewriteEntries, err = oc.RewriteEntries()
+	if err != nil {
+		sl.With("error", err).Error("Error getting origin rewrite entries")
+		return
+	}
+
+	o.blockedServicesSchedule, err = oc.BlockedServicesSchedule()
+	if err != nil {
+		sl.With("error", err).Error("Error getting origin blocked services schedule")
+		return
+	}
+
+	o.filters, err = oc.Filtering()
+	if err != nil {
+		sl.With("error", err).Error("Error getting origin actionFilters")
+		return
+	}
+	o.clients, err = oc.Clients()
+	if err != nil {
+		sl.With("error", err).Error("Error getting origin clients")
+		return
+	}
+	o.queryLogConfig, err = oc.QueryLogConfig()
+	if err != nil {
+		sl.With("error", err).Error("Error getting query log config")
+		return
+	}
+	o.statsConfig, err = oc.StatsConfig()
+	if err != nil {
+		sl.With("error", err).Error("Error getting stats config")
+		return
+	}
+
+	o.accessList, err = oc.AccessList()
+	if err != nil {
+		sl.With("error", err).Error("Error getting access list")
+		return
+	}
+
+	o.dnsConfig, err = oc.DNSConfig()
+	if err != nil {
+		sl.With("error", err).Error("Error getting dns config")
+		return
+	}
+
+	if w.cfg.HasDHCPFeature() {
+		o.dhcpServerConfig, err = oc.DhcpConfig()
+		if err != nil {
+			sl.With("error", err).Error("Error getting dhcp server config")
+			return
+		}
+	}
+
+	if w.cfg.HasTLSFeature() {
+		o.tlsConfig, err = oc.TLSConfig()
+		if err != nil {
+			sl.With("error", err).Error("Error getting tls config")
+			return
+		}
+	}
+
+	replicas := w.cfg.UniqueReplicas()
+	for _, replica := range replicas {
+		w.syncTo(sl, o, replica)
+	}
+}
+
+func (w *worker) syncTo(l *zap.SugaredLogger, o *origin, replica types.Replica) {
+	rc, err := w.createClient(replica.Instance(), w.cfg.ClientTimeout)
+	if err != nil {
+		l.With("error", err, "url", replica.URL).Error("Error creating replica client")
+		return
+	}
+
+	rl := l.With("to", rc.Host())
+	rl.Info("Start sync")
+	start := time.Now()
+	withError := false
+	defer func() {
+		delta := time.Since(start).Seconds()
+		metrics.UpdateResult(rc.Host(), !withError, delta)
+		doneLog := rl.With("duration", fmt.Sprintf("%vs", delta))
+		if withError {
+			doneLog.Error("Sync done")
+		} else {
+			doneLog.Info("Sync done")
+		}
+	}()
+
+	replicaStatus, err := w.statusWithSetup(rl, replica, rc)
+	if err != nil {
+		rl.With("error", err).Error("Error getting replica status")
+		withError = true
+		return
+	}
+
+	rl.With("version", replicaStatus.Version).Info("Connected to replica")
+
+	if versions.IsNewerThan(versions.MinAgh, replicaStatus.Version) {
+		rl.With("error", err, "version", replicaStatus.Version).
+			Errorf("Replica AdGuard Home version must be >= %s", versions.MinAgh)
+		withError = true
+		return
+	}
+
+	if o.status.Version != replicaStatus.Version {
+		rl.With("originVersion", o.status.Version, "replicaVersion", replicaStatus.Version).
+			Warn("Versions do not match")
+	}
+
+	effectiveFeatures := replica.EffectiveFeatures(w.cfg.Features)
+	if replica.Features != nil {
+		replica.Features.LogDisabled(rl)
+	}
+
+	ac := &actionContext{
+		cfg:           w.cfg,
+		rl:            rl,
+		origin:        o,
+		replicaStatus: replicaStatus,
+		client:        rc,
+		replica:       replica,
+	}
+
+	actions := setupActions(effectiveFeatures)
+	for _, action := range actions {
+		if err := action.sync(ac); err != nil {
+			rl.With("error", err).Errorf("Error syncing %s", action.name())
+			withError = true
+			if !w.cfg.ContinueOnError {
+				return
+			}
+		}
+	}
+}
+
+func (*worker) statusWithSetup(
+	rl *zap.SugaredLogger,
+	replica types.Replica,
+	rc client.Client,
+) (*model.ServerStatus, error) {
+	rs, err := rc.Status()
+	if err != nil {
+		if replica.AutoSetup && errors.Is(err, client.ErrSetupNeeded) {
+			if serr := rc.Setup(); serr != nil {
+				rl.With("error", serr).Error("Error setup AdGuardHome")
+				return nil, err
+			}
+			return rc.Status()
+		}
+		return nil, err
+	}
+	return rs, err
+}
+
+type origin struct {
+	status                  *model.ServerStatus
+	rewriteSettings         *model.RewriteSettings
+	rewriteEntries          *model.RewriteEntries
+	blockedServicesSchedule *model.BlockedServicesSchedule
+	filters                 *model.FilterStatus
+	clients                 *model.Clients
+	queryLogConfig          *model.QueryLogConfigWithIgnored
+	statsConfig             *model.GetStatsConfigResponse
+	accessList              *model.AccessList
+	dnsConfig               *model.DNSConfig
+	dhcpServerConfig        *model.DhcpStatus
+	parental                bool
+	safeSearch              *model.SafeSearchConfig
+	profileInfo             *model.ProfileInfo
+	safeBrowsing            bool
+	tlsConfig               *model.TlsConfig
+}

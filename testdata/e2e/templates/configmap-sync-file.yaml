@@ -1,0 +1,31 @@
+{{- if eq .Values.mode "file" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sync-conf
+  namespace: {{ .Release.Namespace }}
+data:
+  config.yaml: |
+    syncTriggerFile: '/trigger/trigger'
+    origin:
+      url: 'http://service-origin.{{ $.Release.Namespace }}.svc.cluster.local:3000'
+      username: username
+      password: password
+    api:
+      port: 9090
+      metrics:
+        enabled: true
+        scrapeInterval: 30s
+    replicas:
+      {{- range $i,$version := .Values.replica.versions }}
+      - url: 'http://service-replica-{{ $version | toString | replace "." "-" }}.{{ $.Release.Namespace }}.svc.cluster.local:3000'
+        username: username
+        password: password
+        autoSetup: true
+        {{- if eq $i 1 }}
+        features:
+          dns:
+            serverConfig: false
+        {{- end }}
+      {{- end }}
+{{- end }}

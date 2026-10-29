@@ -1,0 +1,64 @@
+{{- if and .Values.sync.enabled (eq .Values.mode "file") }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: adguardhome-sync
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: adguardhome-sync
+spec:
+  serviceAccountName: agh-e2e
+  initContainers:
+    - name: wait-for-others
+      image: {{ .Values.kubectl.repository }}:{{ .Values.kubectl.tag }}
+      command:
+        - /bin/bash
+        - -c
+        - |
+          {{- .Files.Get "bin/wait-for-agh-pods.sh" | nindent 10}}
+  containers:
+    - name: adguardhome-sync
+      image: adguardhome-sync:e2e
+      imagePullPolicy: IfNotPresent
+      command:
+        - /opt/go/adguardhome-sync
+        - run
+        - '--config'
+        - /etc/go/adguardhome-sync/config.yaml
+      env:
+        - name: LOG_LEVEL
+          value: 'debug'
+      volumeMounts:
+        - name: config
+          mountPath: /etc/go/adguardhome-sync/
+        - name: trigger
+          mountPath: /trigger
+          readOnly: true
+      livenessProbe:
+        exec:
+          command:
+            - /opt/go/adguardhome-sync
+            - healthcheck
+            - --config
+            - /etc/go/adguardhome-sync/config.yaml
+        initialDelaySeconds: 5
+        periodSeconds: 10
+      readinessProbe:
+        exec:
+          command:
+            - /opt/go/adguardhome-sync
+            - healthcheck
+            - --ready
+            - --config
+            - /etc/go/adguardhome-sync/config.yaml
+        initialDelaySeconds: 5
+        periodSeconds: 10
+  volumes:
+    - name: config
+      configMap:
+        name: sync-conf
+    - name: trigger
+      configMap:
+        name: sync-trigger
+  restartPolicy: Never
+{{- end }}

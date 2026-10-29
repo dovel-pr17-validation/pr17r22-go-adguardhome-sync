@@ -1,0 +1,28 @@
+{{- if eq .Values.mode "env" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sync-conf
+  namespace: {{ .Release.Namespace }}
+data:
+  API_PORT: '9090'
+  API_METRICS_ENABLED: 'true'
+  API_METRICS_SCRAPE_INTERVAL: '30s'
+  API_TLS_CERT_DIR: '/certs'
+  SYNC_TRIGGER_FILE: '/trigger/trigger'
+  API_TLS_CERT_NAME: 'my.crt'
+  API_TLS_KEY_NAME: 'my.key'
+  LOG_FORMAT: 'json'
+  ORIGIN_URL: 'http://service-origin.{{ $.Release.Namespace }}.svc.cluster.local:3000'
+  ORIGIN_PASSWORD: 'password'
+  ORIGIN_USERNAME: 'username'
+  {{- range $i,$version := .Values.replica.versions }}
+  REPLICA{{ add 1 $i }}_AUTO_SETUP: 'true'
+  REPLICA{{ add 1 $i }}_URL: 'http://service-replica-{{ $version | toString | replace "." "-" }}.{{ $.Release.Namespace }}.svc.cluster.local:3000'
+  REPLICA{{ add 1 $i }}_PASSWORD: 'password'
+  REPLICA{{ add 1 $i }}_USERNAME: 'username'
+  {{- if eq $i 1 }}
+  REPLICA{{ add 1 $i }}_FEATURES_DNS_SERVER_CONFIG: 'false'
+  {{- end }}
+  {{- end }}
+{{- end }}

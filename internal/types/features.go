@@ -1,0 +1,202 @@
+package types
+
+import (
+	"encoding/json"
+
+	"go.uber.org/zap"
+)
+
+func NewFeatures(enabled bool) Features {
+	return Features{
+		DNS: DNS{
+			AccessLists:  enabled,
+			ServerConfig: enabled,
+			Rewrites:     enabled,
+		},
+		DHCP: DHCP{
+			ServerConfig: enabled,
+			StaticLeases: enabled,
+		},
+		GeneralSettings: enabled,
+		QueryLogConfig:  enabled,
+		StatsConfig:     enabled,
+		ClientSettings:  enabled,
+		Services:        enabled,
+		Filters: FiltersType{
+			Blacklist: enabled,
+			Whitelist: enabled,
+			UserRules: enabled,
+		},
+		Theme:     enabled,
+		TLSConfig: false,
+	}
+}
+
+// Features feature flags.
+type Features struct {
+	DNS              DNS         `json:"dns"                                                                                                  yaml:"dns"`
+	DHCP             DHCP        `json:"dhcp"                                                                                                 yaml:"dhcp"`
+	GeneralSettings  bool        `docs:"Sync general settings"                                                                                env:"FEATURES_GENERAL_SETTINGS"  json:"generalSettings"  yaml:"generalSettings"`
+	ProtectionStatus bool        `docs:"Sync the protection status (disabled if generalSettings is disabled)"                                 env:"FEATURES_PROTECTION_STATUS" json:"protectionStatus" yaml:"protectionStatus"`
+	QueryLogConfig   bool        `docs:"Sync query log config"                                                                                env:"FEATURES_QUERY_LOG_CONFIG"  json:"queryLogConfig"   yaml:"queryLogConfig"`
+	StatsConfig      bool        `docs:"Sync stats config"                                                                                    env:"FEATURES_STATS_CONFIG"      json:"statsConfig"      yaml:"statsConfig"`
+	ClientSettings   bool        `docs:"Sync client settings"                                                                                 env:"FEATURES_CLIENT_SETTINGS"   json:"clientSettings"   yaml:"clientSettings"`
+	Services         bool        `docs:"Sync services"                                                                                        env:"FEATURES_SERVICES"          json:"services"         yaml:"services"`
+	Filters          FiltersType `docs:"Sync filters (use sub-fields for granular control)"                                                   env:"FEATURES_FILTERS"           json:"filters"          yaml:"filters"`
+	Theme            bool        `docs:"Sync the web UI theme"                                                                                env:"FEATURES_THEME"             json:"theme"            yaml:"theme"`
+	TLSConfig        bool        `docs:"Sync the TLS config (Note: cannot sync inline private keys, only settings and certificate/key paths)" env:"FEATURES_TLS_CONFIG"        json:"tlsConfig"        yaml:"tlsConfig"`
+}
+
+// UnmarshalYAML implements custom unmarshalling for Features.
+func (f *Features) UnmarshalYAML(unmarshal func(any) error) error {
+	*f = NewFeatures(true)
+	type Alias Features
+	a := Alias(*f)
+	if err := unmarshal(&a); err != nil {
+		return err
+	}
+	*f = Features(a)
+	return nil
+}
+
+// UnmarshalJSON implements custom unmarshalling for Features.
+func (f *Features) UnmarshalJSON(b []byte) error {
+	*f = NewFeatures(true)
+	type Alias Features
+	a := Alias(*f)
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	*f = Features(a)
+	return nil
+}
+
+// FiltersType features.
+type FiltersType struct {
+	Blacklist bool `docs:"Sync blacklist filters" env:"FEATURES_FILTERS_BLACKLIST"  json:"blacklist" yaml:"blacklist"`
+	Whitelist bool `docs:"Sync whitelist filters" env:"FEATURES_FILTERS_WHITELIST"  json:"whitelist" yaml:"whitelist"`
+	UserRules bool `docs:"Sync user rules"        env:"FEATURES_FILTERS_USER_RULES" json:"userRules" yaml:"userRules"`
+}
+
+// UnmarshalYAML implements custom unmarshalling for FiltersType.
+func (f *FiltersType) UnmarshalYAML(unmarshal func(any) error) error {
+	var b bool
+	if err := unmarshal(&b); err == nil {
+		f.Blacklist = b
+		f.Whitelist = b
+		f.UserRules = b
+		return nil
+	}
+
+	type Alias FiltersType
+	var a Alias
+	if err := unmarshal(&a); err != nil {
+		return err
+	}
+	*f = FiltersType(a)
+	return nil
+}
+
+// UnmarshalJSON implements custom unmarshalling for FiltersType.
+func (f *FiltersType) UnmarshalJSON(b []byte) error {
+	var v bool
+	if err := json.Unmarshal(b, &v); err == nil {
+		f.Blacklist = v
+		f.Whitelist = v
+		f.UserRules = v
+		return nil
+	}
+
+	type Alias FiltersType
+	var a Alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	*f = FiltersType(a)
+	return nil
+}
+
+// UnmarshalText implements custom unmarshalling for env vars.
+func (f *FiltersType) UnmarshalText(text []byte) error {
+	if string(text) == "true" {
+		f.Blacklist = true
+		f.Whitelist = true
+		f.UserRules = true
+		return nil
+	} else if string(text) == "false" {
+		f.Blacklist = false
+		f.Whitelist = false
+		f.UserRules = false
+		return nil
+	}
+	return json.Unmarshal(text, f)
+}
+
+// DHCP features.
+type DHCP struct {
+	ServerConfig bool `docs:"Sync DHCP server config" env:"FEATURES_DHCP_SERVER_CONFIG" json:"serverConfig" yaml:"serverConfig"`
+	StaticLeases bool `docs:"Sync DHCP static leases" env:"FEATURES_DHCP_STATIC_LEASES" json:"staticLeases" yaml:"staticLeases"`
+}
+
+// DNS features.
+type DNS struct {
+	AccessLists  bool `docs:"Sync DNS access lists"  env:"FEATURES_DNS_ACCESS_LISTS"  json:"accessLists"  yaml:"accessLists"`
+	ServerConfig bool `docs:"Sync DNS server config" env:"FEATURES_DNS_SERVER_CONFIG" json:"serverConfig" yaml:"serverConfig"`
+	Rewrites     bool `docs:"Sync DNS rewrites"      env:"FEATURES_DNS_REWRITES"      json:"rewrites"     yaml:"rewrites"`
+}
+
+// LogDisabled log all disabled features.
+func (f *Features) LogDisabled(l *zap.SugaredLogger) {
+	features := f.collectDisabled()
+
+	if len(features) > 0 {
+		l.With("features", features).Info("Disabled features")
+	}
+}
+
+func (f *Features) collectDisabled() []string {
+	var features []string
+	if !f.DHCP.ServerConfig {
+		features = append(features, "DHCP.ServerConfig")
+	}
+	if !f.DHCP.StaticLeases {
+		features = append(features, "DHCP.StaticLeases")
+	}
+	if !f.DNS.AccessLists {
+		features = append(features, "DNS.AccessLists")
+	}
+	if !f.DNS.ServerConfig {
+		features = append(features, "DNS.ServerConfig")
+	}
+	if !f.DNS.Rewrites {
+		features = append(features, "DNS.Rewrites")
+	}
+	if !f.GeneralSettings {
+		features = append(features, "GeneralSettings")
+	}
+	if !f.QueryLogConfig {
+		features = append(features, "QueryLogConfig")
+	}
+	if !f.StatsConfig {
+		features = append(features, "StatsConfig")
+	}
+	if !f.ClientSettings {
+		features = append(features, "ClientSettings")
+	}
+	if !f.Services {
+		features = append(features, "BlockedServices")
+	}
+	if !f.Filters.Blacklist {
+		features = append(features, "Filters.Blacklist")
+	}
+	if !f.Filters.Whitelist {
+		features = append(features, "Filters.Whitelist")
+	}
+	if !f.Filters.UserRules {
+		features = append(features, "Filters.UserRules")
+	}
+	if !f.TLSConfig {
+		features = append(features, "TLSConfig")
+	}
+	return features
+}

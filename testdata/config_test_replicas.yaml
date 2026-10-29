@@ -1,0 +1,44 @@
+origin:
+  url: https://origin-file:443
+  webURL: https://origin-file:443
+  apiPath: /control
+  username: foo
+  password: '*********'
+  insecureSkipVerify: true
+  autoSetup: false
+replicas:
+  - url: https://replica-file:443
+    webURL: https://replica-file:443
+    apiPath: /control
+    username: bar
+    password: '*********'
+    insecureSkipVerify: false
+    autoSetup: false
+    interfaceName: eth3
+    dhcpServerEnabled: false
+    requestHeaders:
+      FOO: bar
+      Client-ID: xxxx
+cron: '*/15 * * * *'
+runOnStart: true
+printConfigOnly: true
+api:
+  port: 9090
+features:
+  dns:
+    accessLists: true
+    serverConfig: false
+    rewrites: true
+  dhcp:
+    serverConfig: true
+    staticLeases: true
+  generalSettings: true
+  queryLogConfig: true
+  statsConfig: true
+  clientSettings: true
+  services: true
+  filters:
+    blacklist: true
+    whitelist: false
+    userRules: true
+  theme: true

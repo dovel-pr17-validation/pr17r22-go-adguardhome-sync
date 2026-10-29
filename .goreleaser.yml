@@ -1,0 +1,91 @@
+version: 2
+# This is an example goreleaser.yaml file with some sane defaults.
+# Make sure to check the documentation at http://goreleaser.com
+builds:
+  - env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/bakito/adguardhome-sync/version.Version={{.Version}} -X github.com/bakito/adguardhome-sync/version.Build={{.Date}}
+    goos:
+      - linux
+      - windows
+      - darwin
+      - openbsd
+    goarch:
+      - 386
+      - amd64
+      - arm
+      - arm64
+      - riscv64
+    goarm:
+      - 5
+      - 6
+      - 7
+    ignore:
+      - goos: darwin
+        goarch: arm
+      - goos: darwin
+        goarch: riscv64
+      - goos: windows
+        goarch: arm
+      - goos: windows
+        goarch: arm64
+      - goos: windows
+        goarch: riscv64
+      - goos: openbsd
+        goarch: 386
+      - goos: openbsd
+        goarch: arm
+    hooks:
+      post:
+        # don't upx windows binaries as they make trouble with virus scanners
+        - bash -c 'if [[ "{{ .Path }}" != *.exe ]] && [[ "{{ .Path }}" != *darwin* ]] && [[ "{{ .Path }}" != *openbsd* ]] && [[ "{{ .Path }}" != *riscv* ]]; then upx {{ .Path }}; fi'
+checksum:
+  name_template: 'checksums.txt'
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - LICENSE
+      - README.md
+
+snapshot:
+  version_template: "{{ .Version }}-next"
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore'
+release:
+  prerelease: auto
+sboms:
+  - artifacts: archive
+
+homebrew_casks:
+  - name: adguardhome-sync
+    homepage: "https://github.com/bakito/adguardhome-sync"
+    description: "Synchronize AdGuard Home config to replicas"
+    repository:
+      owner: "bakito"
+      name: "homebrew-tap"
+
+signs:
+  - id: default
+    cmd: cosign
+    args:
+      - "sign-blob"
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    signature: "${artifact}.sigstore.json"
+    artifacts: checksum
+    output: true

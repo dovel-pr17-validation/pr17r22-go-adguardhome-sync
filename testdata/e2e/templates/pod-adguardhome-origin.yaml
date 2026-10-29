@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: adguardhome-origin
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: adguardhome-origin
+    bakito.net/adguardhome-sync: origin
+spec:
+  volumes:
+    - name: configmap
+      configMap:
+        name: origin-conf
+    - name: conf
+      emptyDir: { }
+
+  initContainers:
+    - name: init
+      image: busybox
+      volumeMounts:
+        - mountPath: /opt/adguardhome/configmap
+          name: configmap
+        - mountPath: /opt/adguardhome/conf
+          name: conf
+      command:
+        - cp
+        - /opt/adguardhome/configmap/AdGuardHome.yaml
+        - /opt/adguardhome/conf
+
+  containers:
+    - name: adguardhome
+      image: adguard/adguardhome:latest
+      volumeMounts:
+        - mountPath: /opt/adguardhome/conf
+          name: conf
+      ports:
+        - containerPort: 3000
+      readinessProbe:
+        httpGet:
+          path: /
+          port: 3000
+        initialDelaySeconds: 5
+        periodSeconds: 5
+      livenessProbe:
+        httpGet:
+          path: /
+          port: 3000
+        initialDelaySeconds: 10
+        periodSeconds: 10

@@ -1,0 +1,242 @@
+<html lang="en">
+<head>
+    <title>AdGuard Home sync</title>
+    <script type="text/javascript" src="lib/jquery.js"></script>
+    <link rel="stylesheet" href="lib/bootstrap.css">
+    <script type="text/javascript">
+        $(document).ready(function () {
+            $("#showLogs").click(function () {
+                $.get("api/v1/logs", {}, function (data) {
+                        $('#logs').html(data);
+                    }
+                );
+                $.get("api/v1/status", {}, function (status) {
+                        $('#origin').removeClass(function (index, className) {
+                            return (className.match(/(^|\s)btn-\S+/g) || []).join(' ');
+                        }).addClass("btn-" + status.origin.status).attr('title', status.origin.error);
+                        status.replicas.forEach(function (replica, i) {
+                            $('#replica_' + i).removeClass(function (index, className) {
+                                return (className.match(/(^|\s)btn-\S+/g) || []).join(' ');
+                            }).addClass("btn-" + replica.status).attr('title', replica.error);
+                        });
+                    }
+                );
+            });
+            $("#clearLogs").click(function () {
+                $.post("api/v1/clear-logs", {}, function () {
+                        $('#logs').html("");
+                    }
+                );
+            });
+            $("#sync").click(function () {
+                $.post("api/v1/sync", {}, function (data) {
+                });
+                $("#showLogs").click();
+            });
+            $("#showLogs").click();
+        });
+    </script>
+    <link rel="shortcut icon" href="favicon.ico">
+    <style>
+        .stat-card {
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+            padding: 15px;
+            text-align: left;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            height: 100%;
+        }
+        {{- if .Metrics }}
+        .stat-card h3 {
+            margin: 0;
+            font-size: 2rem;
+        }
+        .stat-card p {
+            margin: 5px 0;
+            font-size: 0.9rem;
+        }
+        .percentage {
+            font-size: 0.9rem;
+            text-align: right;
+            height: 20px;
+        }
+        canvas {
+            flex-grow: 1;
+            height: 100px !important;
+        }
+        {{- end }}
+        .button-row {
+            margin-top: 20px;
+        }
+        .btn-group {
+            margin: 5px;
+        }
+    </style>
+</head>
+<body>
+<div class="container-fluid px-4">
+    <div class="row">
+        <div class="d-flex align-items-center mb-3">
+            <img src="logo.svg" alt="Logo" class="me-3" style="height: 4em;">
+            <div>
+                <h1 class="mb-0">AdGuard Home sync</h1>
+                <p class="h6 text-muted mb-0">{{ .Version }} ({{ .Build }})</p>
+            </div>
+        </div>
+    </div>
+    {{- if .Metrics }}
+    <div class="row g-4 d-flex">
+        <div class="col-12 col-md-3 d-flex">
+            <div class="stat-card flex-fill">
+                <div class="percentage"></div>
+                <h3 style="color: rgb(78, 141, 245);">{{.Stats.TotalDNS}}</h3>
+                <p>DNS Queries</p>
+                <canvas id="dnsQueriesChart"></canvas>
+            </div>
+        </div>
+
+        <div class="col-12 col-md-3 d-flex">
+            <div class="stat-card flex-fill">
+                <div class="percentage" style="color: rgb(255, 94, 94);">{{.Stats.BlockedPercentage}}%</div>
+                <h3 style="color: rgb(255, 94, 94);">{{.Stats.TotalBlocked}}</h3>
+                <p>Blocked by Filters</p>
+                <canvas id="blockedFiltersChart"></canvas>
+            </div>
+        </div>
+
+        <div class="col-12 col-md-3 d-flex">
+            <div class="stat-card flex-fill">
+                <div class="percentage" style="color: rgb(110, 224, 122);">{{.Stats.MalwarePercentage}}%</div>
+                <h3 style="color: rgb(110, 224, 122);">{{.Stats.TotalMalware}}</h3>
+                <p>Blocked malware/phishing</p>
+                <canvas id="malwareChart"></canvas>
+            </div>
+        </div>
+
+        <div class="col-12 col-md-3 d-flex">
+            <div class="stat-card flex-fill">
+                <div class="percentage" style="color: rgb(232, 198, 78);">{{.Stats.AdultPercentage}}%</div>
+                <h3 style="color: rgb(232, 198, 78);">{{.Stats.TotalAdult}}</h3>
+                <p>Blocked adult websites</p>
+                <canvas id="adultWebsitesChart"></canvas>
+            </div>
+        </div>
+    </div>
+    {{- end }}
+    <div class="row button-row">
+        <div class="col">
+            <div class="btn-group" role="group">
+                <button type="button" class="btn btn-success" id="sync">Synchronize</button>
+                <button type="button" class="btn btn-secondary" id="showLogs">Update Logs</button>
+                <button type="button" class="btn btn-secondary dropdown-toggle dropdown-toggle-split" data-bs-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+                </button>
+                <div class="dropdown-menu">
+                    <a class="dropdown-item" href="#" id="clearLogs">Clear Logs</a>
+                </div>
+
+            </div>
+        </div>
+        <div class="col col-md-auto">
+            <div class="btn-group float-right" role="group">
+                <a href="{{ .SyncStatus.Origin.URL }}" target="_blank" class="btn btn-{{ .SyncStatus.Origin.Status }}"
+                   type="button" id="origin"
+                   {{ if .SyncStatus.Origin.Error }} title="{{ .SyncStatus.Origin.Error }}" {{ end }}>Origin {{ .SyncStatus.Origin.Host }}</a>
+                {{ range $i, $r := .SyncStatus.Replicas }}
+                <a href="{{ $r.URL }}" target="_blank" class="btn btn-{{ $r.Status }}"
+                   type="button" id="replica_{{ $i }}"
+                   {{ if $r.Error }} title="{{ $r.Error }}" {{ end }} >Replica {{ $r.Host }}</a>
+                {{ end }}
+            </div>
+        </div>
+    </div>
+    <div class="row  mt-3">
+        <div class="col-12 col-md-12">
+            <div class="stat-card">
+                <pre class="p-3 border"><code id="logs"></code></pre>
+            </div>
+        </div>
+    </div>
+</div>
+<!-- openssl dgst -sha384 -binary popper.min.js | openssl base64 -A  -->
+<script src="lib/popper.js" ></script>
+<script src="lib/bootstrap.js" ></script>
+{{- if .Metrics }}
+<script src="lib/chart.js" ></script>
+<script>
+    // Function to create minimal line charts
+    function createChart(canvasId, data) {
+        const ctx = document.getElementById(canvasId).getContext('2d');
+
+        const datasets = Array(data.length);
+        for (let i = 0; i < data.length; i++) {
+            datasets[i] = {
+                data: data[i].data,
+                title:  data[i].title,
+                backgroundColor: `rgb(${data[i].r}, ${data[i].g}, ${data[i].b}, 0.2)`,
+                borderColor: `rgb(${data[i].r}, ${data[i].g}, ${data[i].b}, 1)`,
+                borderWidth: 3,
+                fill: data[i].fill,
+                pointRadius: 0,
+            }
+        }
+
+        new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: {{.Stats.Labels}},
+                datasets: datasets
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: {
+                    mode: 'index',
+                    intersect: false,
+                },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        enabled: true,
+                        bodyFont: {
+                            size: 20
+                        },
+                        titleFont: {
+                            size: 20
+                        },
+                        displayColors: false,
+                        callbacks: {
+                            label: function(tooltipItem) {
+                                if (tooltipItem.dataset.title) {
+                                    return tooltipItem.raw + " - " + tooltipItem.dataset.title;
+                                }
+                                return tooltipItem.raw;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    x: { display: false,
+                        title: {
+                            display: true
+                        }
+                    },
+                    y: { display: false,
+                        min: 0,
+                        title: {
+                            display: true
+                        } }
+                }
+            }
+        });
+    }
+
+    createChart('dnsQueriesChart', {{.Stats.DNS}});
+    createChart('blockedFiltersChart', {{.Stats.Blocked}});
+    createChart('malwareChart', {{.Stats.Malware}});
+    createChart('adultWebsitesChart', {{.Stats.Adult}});
+</script>
+{{- end }}
+</body>
+</html>

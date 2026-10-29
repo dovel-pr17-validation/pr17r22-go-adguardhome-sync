@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: origin-conf
+  namespace: {{ .Release.Namespace }}
+data:
+  AdGuardHome.yaml: |
+  {{- .Files.Get "resources/AdGuardHome.yaml" | nindent 4 }}
